@@ -27,8 +27,7 @@ fi
 
 echo "Discovered ${#manifests[@]} project(s)."
 
-readonly ROOT_DIR
-ROOT_DIR="$(git rev-parse --show-toplevel)"
+readonly ROOT_DIR="$(git rev-parse --show-toplevel)"
 
 quality_checks=0
 skipped_checks=0
