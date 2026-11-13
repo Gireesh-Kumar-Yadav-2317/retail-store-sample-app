@@ -3,42 +3,75 @@
 
 set -Eeuo pipefail
 
+# --------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------
+
 readonly SOURCE_DIR="src"
+
 readonly EXCLUDED_DIRS=(
+    .git
     node_modules
     target
     vendor
     dist
     build
-    .git
 )
 
-readonly ROOT_DIR="$(git rev-parse --show-toplevel)"
+# --------------------------------------------------
+# 2. Repository initialization
+# --------------------------------------------------
+
+if ! ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "::error::Unable to determine Git repository root."
+    exit 1
+fi
+
+readonly ROOT_DIR
 readonly ROOT_SOURCE_DIR="$ROOT_DIR/$SOURCE_DIR"
+
+cd "$ROOT_DIR"
+
+# Always return to the repository root when the script exits.
+trap 'cd "$ROOT_DIR"' EXIT
 
 success_count=0
 failure_count=0
 
+declare -a failed_projects=()
+
 # --------------------------------------------------
-# 1. Validate environment
+# 3. Logging
 # --------------------------------------------------
 
-echo "Starting dynamic application builds..."
+log_info() {
+    echo "[INFO] $*"
+}
+
+log_error() {
+    echo "::error::$*"
+}
+
+# --------------------------------------------------
+# 4. Validate environment
+# --------------------------------------------------
+
+log_info "Starting dynamic application builds..."
 
 if [[ ! -d "$ROOT_SOURCE_DIR" ]]; then
-    echo "::error::Source directory does not exist: $ROOT_SOURCE_DIR"
+    log_error "Source directory does not exist: $ROOT_SOURCE_DIR"
     exit 1
 fi
 
-for tool in git find sort; do
+for tool in find sort dirname; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "::error::Required command is unavailable: $tool"
+        log_error "Required command is unavailable: $tool"
         exit 1
     fi
 done
 
 # --------------------------------------------------
-# 2. Discover projects
+# 5. Discover projects
 # --------------------------------------------------
 
 find_args=("$ROOT_SOURCE_DIR")
@@ -51,53 +84,72 @@ mapfile -t manifests < <(
     find "${find_args[@]}" \
         -type f \
         \( -name pom.xml -o -name go.mod -o -name package.json \) \
-        -print | sort
+        -print |
+        sort
 )
 
 if [[ ${#manifests[@]} -eq 0 ]]; then
-    echo "::error::No supported projects discovered."
+    log_error "No supported projects discovered."
     exit 1
 fi
 
-echo "Discovered ${#manifests[@]} project(s)."
+log_info "Discovered ${#manifests[@]} project(s)."
 
 # --------------------------------------------------
-# 3. Build projects
+# 6. Build projects
 # --------------------------------------------------
 
 for manifest in "${manifests[@]}"; do
 
     project_dir="$(dirname "$manifest")"
-    project_path="$ROOT_DIR/$project_dir"
+
+    # find starts from ROOT_SOURCE_DIR, so manifest and
+    # project_dir are already absolute paths.
+    project_path="$project_dir"
+
+    project_name="${project_dir#"$ROOT_DIR"/}"
 
     echo
     echo "======================================"
-    echo "Building: $project_dir"
+    echo "Building: $project_name"
     echo "======================================"
 
+    if [[ ! -d "$project_path" ]]; then
+        log_error "Project directory does not exist: $project_path"
+        ((failure_count += 1))
+        failed_projects+=("$project_name")
+        continue
+    fi
+
     cd "$project_path"
+
+    build_succeeded=false
 
     case "$manifest" in
 
         */pom.xml)
 
-            echo "Technology: Java / Maven"
+            log_info "Technology: Java / Maven"
 
             if [[ -x ./mvnw ]]; then
+
                 ./mvnw \
                     --batch-mode \
                     --no-transfer-progress \
-                    package
+                    package || continue
 
             elif command -v mvn >/dev/null 2>&1; then
+
                 mvn \
                     --batch-mode \
                     --no-transfer-progress \
-                    package
+                    package || continue
 
             else
-                echo "::error::Maven is unavailable for $project_dir"
-                exit 1
+                log_error "Maven is unavailable for $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
 
             shopt -s nullglob
@@ -105,91 +157,150 @@ for manifest in "${manifests[@]}"; do
             shopt -u nullglob
 
             if [[ ${#artifacts[@]} -eq 0 ]]; then
-                echo "::error::No JAR or WAR artifact found in $project_dir"
-                exit 1
+                log_error "No JAR or WAR artifact found in $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
+
+            build_succeeded=true
 
             for artifact in "${artifacts[@]}"; do
                 if [[ ! -s "$artifact" ]]; then
-                    echo "::error::Empty build artifact: $artifact"
-                    exit 1
+                    log_error "Empty build artifact: $artifact"
+                    build_succeeded=false
+                    break
                 fi
 
-                echo "Artifact: $artifact"
+                log_info "Artifact: $artifact"
             done
             ;;
 
         */go.mod)
 
-            echo "Technology: Go"
+            log_info "Technology: Go"
 
             if ! command -v go >/dev/null 2>&1; then
-                echo "::error::Go is unavailable for $project_dir"
-                exit 1
+                log_error "Go is unavailable for $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
 
-            go build -o build/application .
+            if ! go build -o build/application .; then
+                log_error "Go build failed for $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
+            fi
 
             if [[ ! -s build/application ]]; then
-                echo "::error::Go build artifact is missing or empty."
-                exit 1
+                log_error "Go build artifact is missing or empty."
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
 
-            echo "Artifact: build/application"
+            log_info "Artifact: build/application"
+            build_succeeded=true
             ;;
 
         */package.json)
 
-            echo "Technology: Node.js"
+            log_info "Technology: Node.js"
 
             if ! command -v node >/dev/null 2>&1; then
-                echo "::error::Node.js is unavailable for $project_dir"
-                exit 1
+                log_error "Node.js is unavailable for $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
 
             if ! node -e '
                 const p = require("./package.json");
                 process.exit(p.scripts?.build ? 0 : 1);
             '; then
-                echo "::error::No build script configured in $project_dir/package.json"
-                exit 1
+                log_error "No build script configured in $project_name/package.json"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
 
-            if [[ -f pnpm-lock.yaml ]]; then
-                corepack pnpm run build
+            if ! command -v corepack >/dev/null 2>&1; then
+                log_error "Corepack is unavailable for $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
+            fi
 
-            elif [[ -f yarn.lock ]]; then
-                corepack yarn build
+            if [[ -f yarn.lock ]]; then
+                if ! corepack yarn build; then
+                    log_error "Yarn build failed for $project_name"
+                    ((failure_count += 1))
+                    failed_projects+=("$project_name")
+                    continue
+                fi
+
+            elif [[ -f pnpm-lock.yaml ]]; then
+                if ! corepack pnpm run build; then
+                    log_error "pnpm build failed for $project_name"
+                    ((failure_count += 1))
+                    failed_projects+=("$project_name")
+                    continue
+                fi
 
             elif [[ -f package-lock.json ]]; then
-                npm run build
+                if ! npm run build; then
+                    log_error "npm build failed for $project_name"
+                    ((failure_count += 1))
+                    failed_projects+=("$project_name")
+                    continue
+                fi
 
             else
-                echo "::error::No supported lockfile found in $project_dir"
-                exit 1
+                log_error "No supported lockfile found in $project_name"
+                ((failure_count += 1))
+                failed_projects+=("$project_name")
+                continue
             fi
+
+            build_succeeded=true
             ;;
 
     esac
 
-    ((success_count += 1))
-
-    echo "SUCCESS: $project_dir"
+    if [[ "$build_succeeded" == true ]]; then
+        ((success_count += 1))
+        log_info "SUCCESS: $project_name"
+    else
+        log_error "Build artifact validation failed: $project_name"
+        ((failure_count += 1))
+        failed_projects+=("$project_name")
+    fi
 
 done
 
 # --------------------------------------------------
-# 4. Build summary
+# 7. Build summary
 # --------------------------------------------------
-
-cd "$ROOT_DIR"
 
 echo
 echo "======================================"
 echo "APPLICATION BUILD SUMMARY"
 echo "======================================"
 
+echo "Discovered projects: ${#manifests[@]}"
 echo "Successful projects: $success_count"
 echo "Failed projects: $failure_count"
 
-echo "All discovered projects built successfully."
+if [[ ${#failed_projects[@]} -gt 0 ]]; then
+    echo
+    echo "Failed projects:"
+
+    printf ' - %s\n' "${failed_projects[@]}"
+
+    log_error "One or more application builds failed."
+    exit 1
+fi
+
+log_info "All discovered projects built successfully."
