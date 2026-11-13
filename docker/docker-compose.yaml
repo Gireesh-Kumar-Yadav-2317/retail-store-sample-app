@@ -1,0 +1,257 @@
+name: retail-store
+x-app-defaults: &app-defaults
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  networks:
+    - retail-network
+
+services:
+  ui:
+    <<: *app-defaults
+    image: retail-ui:dev
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      JAVA_OPTS: "-XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/urandom"
+      SERVER_TOMCAT_ACCESSLOG_ENABLED: "true"
+      RETAIL_UI_SEARCH_ENABLED: "${SEARCH_ENABLED:-false}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:8080/actuator/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  catalog:
+    <<: *app-defaults
+    image: retail-catalog:dev
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      GIN_MODE: release
+      RETAIL_CATALOG_PERSISTENCE_PROVIDER: mysql
+      RETAIL_CATALOG_PERSISTENCE_PASSWORD: "${CATALOG_DB_PASSWORD:?Set CATALOG_DB_PASSWORD}"
+      RETAIL_CATALOG_PERSISTENCE_ENDPOINT: catalog-db:3306
+      RETAIL_CATALOG_SEARCH_ENABLED: "${SEARCH_ENABLED:-false}"
+      RETAIL_CATALOG_SEARCH_OS_ENDPOINT: http://opensearch:9200
+      RETAIL_CATALOG_SEARCH_OS_INDEX: products
+      RETAIL_CATALOG_SEARCH_OS_TLS_SKIP_VERIFY: "true"
+    depends_on:
+      catalog-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:8080/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  catalog-db:
+    image: mariadb:10.9
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${CATALOG_DB_ROOT_PASSWORD:?Set CATALOG_DB_ROOT_PASSWORD}"
+      MYSQL_DATABASE: catalogdb
+      MYSQL_USER: catalog_user
+      MYSQL_PASSWORD: "${CATALOG_DB_PASSWORD:?Set CATALOG_DB_PASSWORD}"
+    volumes:
+      - catalog-db-data:/var/lib/mysql
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+  opensearch:
+    image: opensearchproject/opensearch:3.5.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:9200/_cluster/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+  cart:
+    <<: *app-defaults
+    image: retail-cart:dev
+    hostname: carts
+    ports:
+      - "127.0.0.1:8082:8080"
+    environment:
+      SERVER_TOMCAT_ACCESSLOG_ENABLED: "true"
+      RETAIL_CART_PERSISTENCE_PROVIDER: dynamodb
+      RETAIL_CART_PERSISTENCE_DYNAMODB_ENDPOINT: http://carts-db:8000
+      RETAIL_CART_PERSISTENCE_DYNAMODB_CREATE_TABLE: "true"
+      AWS_ACCESS_KEY_ID: key
+      AWS_SECRET_ACCESS_KEY: dummy
+    depends_on:
+      carts-db:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:8080/actuator/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  carts-db:
+    image: amazon/dynamodb-local:1.20.0
+    restart: unless-stopped
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+  orders:
+    <<: *app-defaults
+    image: retail-orders:dev
+    ports:
+      - "127.0.0.1:8083:8080"
+    environment:
+      reschedule: on-node-failure
+      SERVER_TOMCAT_ACCESSLOG_ENABLED: "true"
+      RETAIL_ORDERS_PERSISTENCE_PROVIDER: postgres
+      RETAIL_ORDERS_PERSISTENCE_ENDPOINT: orders-db:5432
+      RETAIL_ORDERS_PERSISTENCE_NAME: orders
+      RETAIL_ORDERS_PERSISTENCE_USERNAME: orders_user
+      RETAIL_ORDERS_PERSISTENCE_PASSWORD: "${ORDERS_DB_PASSWORD:?Set ORDERS_DB_PASSWORD}"
+      RETAIL_ORDERS_MESSAGING_PROVIDER: rabbitmq
+      RETAIL_ORDERS_MESSAGING_RABBITMQ_ADDRESSES: rabbitmq:5672
+      RETAIL_ORDERS_MESSAGING_RABBITMQ_USERNAME: rabbitmq
+      RETAIL_ORDERS_MESSAGING_RABBITMQ_PASSWORD: "${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}"
+    depends_on:
+      orders-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:8080/actuator/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  orders-db:
+    image: postgres:16.1
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders_user
+      POSTGRES_PASSWORD: "${ORDERS_DB_PASSWORD:?Set ORDERS_DB_PASSWORD}"
+    volumes:
+      - orders-db-data:/var/lib/postgresql/data
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbitmq
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:15672:15672"
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - rabbitmq-diagnostics
+        - -q
+        - ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+  checkout:
+    <<: *app-defaults
+    image: retail-checkout:dev
+    ports:
+      - "127.0.0.1:8085:8080"
+    environment:
+      RETAIL_CHECKOUT_PERSISTENCE_PROVIDER: redis
+      RETAIL_CHECKOUT_PERSISTENCE_REDIS_URL: redis://checkout-redis:6379
+    depends_on:
+      checkout-redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:8080/health || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  checkout-redis:
+    image: redis:6.0-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - checkout-redis-data:/data
+    networks:
+      - retail-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  catalog-db-data:
+  opensearch-data:
+  orders-db-data:
+  rabbitmq-data:
+  checkout-redis-data:
+networks:
+  retail-network:
+    driver: bridge

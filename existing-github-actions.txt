@@ -1,0 +1,459 @@
+
+==================================================
+FILE: .github/workflows/artifacts.yaml
+==================================================
+name: Publish Artifacts
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        default: "-"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build Images
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: amd64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+      - name: "Setup Docker"
+        uses: ./.github/actions/setup-docker
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: "Get AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GithubActionsSession
+
+      - name: "Login to Amazon ECR Public"
+        id: login-ecr-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Build
+        env:
+          TAG_NAME: ${{ inputs.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          AWS_ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+        run: |
+          export IMAGE_TAG=${TAG_NAME#v}
+          export GOPROXY="https://proxy.golang.org,direct"
+
+          # Build first to prevent partial container set push
+          yarn nx run-many -t container --projects=tag:service --tags ${AWS_ECR_REPOSITORY}/retail-store-sample-{projectName}:${IMAGE_TAG}-${TARGET_ARCH}
+          yarn nx container load-generator --tags ${AWS_ECR_REPOSITORY}/retail-store-sample-utils:load-gen.${IMAGE_TAG}-${TARGET_ARCH}
+
+          # Then push
+          yarn nx run-many -t container --push true --projects=tag:service --tags ${AWS_ECR_REPOSITORY}/retail-store-sample-{projectName}:${IMAGE_TAG}-${TARGET_ARCH}
+          yarn nx container load-generator --push true --tags ${AWS_ECR_REPOSITORY}/retail-store-sample-utils:load-gen.${IMAGE_TAG}-${TARGET_ARCH}
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: "Get AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GithubActionsSession
+
+      - name: "Login to Amazon ECR Public"
+        id: login-ecr-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Push manifests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.version }}
+          AWS_ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+        run: |
+          export IMAGE_TAG=${TAG_NAME#v}
+
+          yarn nx run-many -t manifest --projects=tag:service --args="--repository=${AWS_ECR_REPOSITORY}/retail-store-sample-{projectName},--tag=${IMAGE_TAG}"
+          yarn nx manifest load-generator --args="--repository=${AWS_ECR_REPOSITORY}/retail-store-sample-utils,--tag=load-gen.${IMAGE_TAG}"
+
+          yarn nx run-many -t helm --projects=tag:service --remote oci://${AWS_ECR_REPOSITORY} --push
+
+          bash scripts/compose-dist.sh
+
+          gh release upload ${TAG_NAME} ./dist/docker-compose/docker-compose.yaml --clobber
+
+          bash scripts/kubernetes-dist.sh
+
+          gh release upload ${TAG_NAME} ./dist/kubernetes/kubernetes.yaml --clobber
+
+          zip -j /tmp/sample-images.zip samples/images/*
+
+          gh release upload ${TAG_NAME} /tmp/sample-images.zip --clobber
+
+==================================================
+FILE: .github/workflows/e2e-test.yml
+==================================================
+name: E2E Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  docker:
+    name: Docker E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: Compose up
+        run: |
+          yarn nx compose:up ui
+          sleep 60
+      - name: Test
+        run: |
+          CYPRESS_BASE_URL='http://localhost:8888' yarn nx execute e2e
+      - name: Compose down
+        run: |
+          yarn nx compose:down ui
+
+  docker-multi:
+    name: Docker E2E Tests (Multi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: Compose up
+        run: |
+          DB_PASSWORD='test123' docker compose \
+            -f src/app/docker-compose.yml \
+            -f src/app/compose.override.yaml \
+            -f src/app/docker-compose.tracing.yml \
+            up --build --detach --wait
+          sleep 30
+      - name: Run functional tests
+        run: |
+          CYPRESS_BASE_URL='http://localhost:8888' yarn nx execute e2e
+      - name: Run trace assertions
+        run: |
+          # Wait for traces to be received
+          sleep 90
+          bash src/e2e/scripts/assert-traces.sh
+      - name: Run load test
+        run: |
+          cd src/load-generator
+          bash scripts/run-test.sh
+      - name: Compose down
+        if: always()
+        run: |
+          DB_PASSWORD='test123' docker compose \
+            -f src/app/docker-compose.yml \
+            -f src/app/compose.override.yaml \
+            -f src/app/docker-compose.tracing.yml \
+            down
+
+  docker-multi-search:
+    name: Docker E2E Tests (Multi/Search)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: Compose up
+        run: |
+          DB_PASSWORD='test123' SEARCH_ENABLED=true yarn nx compose:up
+          sleep 60
+      - name: Test
+        run: |
+          CYPRESS_BASE_URL='http://localhost:8888' CYPRESS_SEARCH_ENABLED=true yarn nx execute e2e
+      - name: Load Generator
+        run: |
+          cd src/load-generator
+          bash scripts/run-test.sh
+      - name: Compose down
+        run: |
+          DB_PASSWORD='test123' SEARCH_ENABLED=true yarn nx compose:down
+
+  kubernetes:
+    name: Kubernetes E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+
+      - name: Build images
+        run: |
+          yarn nx run-many -t build --projects=tag:service --parallel=1
+
+          yarn nx run-many -t container --projects=tag:service \
+            --tags public.ecr.aws/aws-containers/retail-store-sample-{projectName}:e2e --parallel=5
+
+      - name: Kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: kind
+          version: v0.17.0
+
+      - name: Load images
+        env:
+          IMAGE_TAG: e2e
+        run: |
+          kind load docker-image public.ecr.aws/aws-containers/retail-store-sample-catalog:$IMAGE_TAG
+          kind load docker-image public.ecr.aws/aws-containers/retail-store-sample-cart:$IMAGE_TAG
+          kind load docker-image public.ecr.aws/aws-containers/retail-store-sample-checkout:$IMAGE_TAG
+          kind load docker-image public.ecr.aws/aws-containers/retail-store-sample-orders:$IMAGE_TAG
+          kind load docker-image public.ecr.aws/aws-containers/retail-store-sample-ui:$IMAGE_TAG
+
+          docker system prune --all --force
+
+      - name: Deploy
+        env:
+          IMAGE_TAG: e2e
+        run: |
+          NODE_PORT=30000 helmfile apply -f src/app/helmfile.yaml --wait --skip-diff-on-install
+
+          kubectl wait --for=condition=Ready pod -l app.kubernetes.io/owner=retail-store-sample --timeout 180s || exit_code=$?
+
+      - name: Test
+        run: |
+          bash scripts/e2e-kind.sh
+
+==================================================
+FILE: .github/workflows/oss.yml
+==================================================
+name: OSS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  attribution:
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cart, catalog, checkout, orders, ui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: Run
+        env:
+          COMPONENT_NAME: ${{ matrix.component }}
+        run: |
+          yarn nx build attribution
+
+          sudo bash oss/run.sh -s $COMPONENT_NAME --root
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v4
+        with:
+          add-path: src/**/ATTRIBUTION.md
+          branch: attribution-updates-${{ matrix.component }}
+          title: "chore(deps): Update OSS attribution for ${{ matrix.component }}"
+          commit-message: "chore: Updating OSS attribution for ${{ matrix.component }}"
+          delete-branch: true
+          labels: |
+            automerge
+          add-paths: |
+            src/*/ATTRIBUTION.md
+
+==================================================
+FILE: .github/workflows/pr.yaml
+==================================================
+name: "PR"
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - edited
+      - synchronize
+
+permissions:
+  pull-requests: read
+
+jobs:
+  semanticpr:
+    name: "Semantic Pull Request"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  hooks:
+    name: "Hooks"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Setup Env
+        uses: ./.github/actions/setup-env
+      - name: Lint
+        run: |
+          git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | \
+            yarn lefthook run pre-commit-ci --files-from-stdin
+
+  test:
+    name: "Project tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: "Setup Env"
+        uses: ./.github/actions/setup-env
+      - name: Build
+        run: |
+          yarn nx affected --targets=build --base origin/main --parallel 1
+      - name: Other tasks
+        run: |
+          yarn nx affected --targets=lint,test:integration,test --base origin/main
+      - name: Containers
+        run: |
+          yarn nx affected --targets=container --exclude='*,!tag:container' --base origin/main
+
+==================================================
+FILE: .github/workflows/publish-build.yml
+==================================================
+name: Publish Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version"
+        required: true
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  artifacts:
+    uses: ./.github/workflows/artifacts.yaml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit
+
+==================================================
+FILE: .github/workflows/release-please.yml
+==================================================
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+name: Release
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  artifacts:
+    uses: ./.github/workflows/artifacts.yaml
+    needs: release-please
+    if: needs.release-please.outputs.release_created
+    with:
+      version: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit
+
+==================================================
+FILE: .github/actions/setup-docker/action.yml
+==================================================
+name: "Setup Docker"
+description: "Sets up Docker for multi-architecture builds"
+runs:
+  using: "composite"
+  steps:
+    - name: Set up QEMU
+      id: qemu
+      uses: docker/setup-qemu-action@v3
+      with:
+        image: tonistiigi/binfmt:latest
+        platforms: all
+    - name: Set up Docker
+      uses: docker/setup-docker-action@v4
+      with:
+        daemon-config: |
+          {
+            "features": {
+              "containerd-snapshotter": true
+            }
+          }
+    - name: Set up Docker Buildx
+      id: buildx
+      uses: docker/setup-buildx-action@v3
+outputs:
+  builder:
+    description: "Buildx builder name"
+    value: ${{ steps.buildx.outputs.name }}
+
+==================================================
+FILE: .github/actions/setup-env/action.yml
+==================================================
+name: "Setup env"
+description: "Install required environment components"
+runs:
+  using: "composite"
+  steps:
+    - uses: jdx/mise-action@v3
+    - name: yarn install
+      shell: bash
+      run: |
+        corepack enable
+        yarn install
