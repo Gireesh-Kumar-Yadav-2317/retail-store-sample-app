@@ -215,13 +215,6 @@ jobs:
 
       - name: Run dynamic project tests
         shell: bash
-        run: |
-          set -Eeuo pipefail
-          bash ./scripts/ci/test-projects.sh
-
-
-      - name: Run dynamic project tests
-        shell: bash
         env:
           # Dummy credentials for local AWS service testing.
           # These are NOT real AWS credentials.
