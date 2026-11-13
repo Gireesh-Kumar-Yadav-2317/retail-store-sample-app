@@ -219,16 +219,18 @@ jobs:
           set -Eeuo pipefail
           bash ./scripts/ci/test-projects.sh
 
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: application-test-reports
-          path: |
-            src/**/target/surefire-reports/**
-            src/**/target/failsafe-reports/**
-          if-no-files-found: warn
-          retention-days: 7
+
+      - name: Run dynamic project tests
+        shell: bash
+        env:
+          # Dummy credentials for local AWS service testing.
+          # These are NOT real AWS credentials.
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+        run: |
+          set -Eeuo pipefail
+          bash ./scripts/ci/test-projects.sh
 
 
   code-quality:
