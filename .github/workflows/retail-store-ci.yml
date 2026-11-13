@@ -157,7 +157,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ./scripts/ci/setup-runtimes.sh
+          bash ./scripts/ci/setup-runtimes.sh
 
   application-tests:
     name: Dynamic application tests
@@ -194,7 +194,7 @@ jobs:
       # Install Node.js only when a Node.js project is discovered.
       - name: Set up Node.js
         if: needs.discover-runtimes.outputs.node-version != ''
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ needs.discover-runtimes.outputs.node-version }}
 
@@ -212,7 +212,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ./scripts/ci/test-projects.sh
+          bash ./scripts/ci/test-projects.sh
 
   code-quality:
     name: Static code quality analysis
@@ -252,4 +252,46 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ./scripts/ci/quality-checks.sh
+          bash ./scripts/ci/quality-checks.sh
+
+  build-projects:
+    name: Build application projects
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    needs:
+      - discover-runtimes
+      - application-tests
+      - code-quality
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        if: needs.discover-runtimes.outputs.java-version != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ needs.discover-runtimes.outputs.java-version }}
+
+      - name: Set up Go
+        if: needs.discover-runtimes.outputs.go-version != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.discover-runtimes.outputs.go-version }}
+
+      - name: Set up Node.js
+        if: needs.discover-runtimes.outputs.node-version != ''
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ needs.discover-runtimes.outputs.node-version }}
+
+      - name: Build discovered projects
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash ./scripts/ci/build-projects.sh
