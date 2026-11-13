@@ -1,21 +1,43 @@
+
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
 
 readonly SOURCE_DIR="src"
 
+# --------------------------------------------------
+# Validate source directory
+# --------------------------------------------------
+
 if [[ ! -d "$SOURCE_DIR" ]]; then
     echo "::error::Source directory '$SOURCE_DIR' does not exist."
     exit 1
 fi
 
+echo "======================================"
 echo "Discovering application projects..."
+echo "======================================"
+
+# --------------------------------------------------
+# Discover supported project manifests
+# --------------------------------------------------
 
 mapfile -t manifests < <(
     find "$SOURCE_DIR" \
-        \( -name node_modules -o -name target -o -name vendor -o -name dist \) -prune -o \
+        \( \
+            -name .git \
+            -o -name node_modules \
+            -o -name target \
+            -o -name vendor \
+            -o -name dist \
+            -o -name build \
+        \) -prune -o \
         -type f \
-        \( -name pom.xml -o -name go.mod -o -name package.json \) \
+        \( \
+            -name pom.xml \
+            -o -name go.mod \
+            -o -name package.json \
+        \) \
         -print | sort
 )
 
@@ -26,7 +48,12 @@ fi
 
 echo "Discovered ${#manifests[@]} project manifest(s)."
 
+# --------------------------------------------------
+# Process every discovered project
+# --------------------------------------------------
+
 for manifest in "${manifests[@]}"; do
+
     project_dir="$(dirname "$manifest")"
 
     echo
@@ -35,63 +62,196 @@ for manifest in "${manifests[@]}"; do
     echo "Manifest: $manifest"
     echo "======================================"
 
-    cd "$(git rev-parse --show-toplevel)/$project_dir"
+    ROOT_DIR="$(git rev-parse --show-toplevel)"
+
+    cd "$ROOT_DIR/$project_dir"
+
+    # --------------------------------------------------
+    # Java / Maven
+    # --------------------------------------------------
 
     case "$manifest" in
 
         */pom.xml)
+
             echo "Technology detected: Java / Maven"
 
-            if [[ -x ./mvnw ]]; then
-                ./mvnw --batch-mode --no-transfer-progress clean verify
+            if [[ -f ./mvnw ]]; then
+
+                echo "Using Maven Wrapper"
+
+                bash ./mvnw \
+                    --batch-mode \
+                    --no-transfer-progress \
+                    clean verify
+
             elif command -v mvn >/dev/null 2>&1; then
-                mvn --batch-mode --no-transfer-progress clean verify
+
+                echo "Using system Maven"
+
+                mvn \
+                    --batch-mode \
+                    --no-transfer-progress \
+                    clean verify
+
             else
-                echo "::error::Maven or Maven Wrapper is unavailable."
+
+                echo "::error::Maven is not installed and Maven Wrapper is missing."
                 exit 1
+
             fi
+
+            echo "SUCCESS: $project_dir"
             ;;
+
+        # --------------------------------------------------
+        # Go
+        # --------------------------------------------------
 
         */go.mod)
+
             echo "Technology detected: Go"
 
-            go test -race -count=1 ./...
+            if ! command -v go >/dev/null 2>&1; then
+                echo "::error::Go is not installed."
+                exit 1
+            fi
+
+            go test \
+                -race \
+                -count=1 \
+                ./...
+
+            echo "SUCCESS: $project_dir"
             ;;
 
+        # --------------------------------------------------
+        # Node.js
+        # --------------------------------------------------
+
         */package.json)
+
             echo "Technology detected: Node.js"
 
-            if ! python3 -c \
-                'import json; import sys; p=json.load(open("package.json")); sys.exit(0 if p.get("scripts", {}).get("test") else 1)'
-            then
-                echo "::error::Missing test script in $project_dir/package.json"
+            if ! command -v node >/dev/null 2>&1; then
+                echo "::error::Node.js is not installed."
                 exit 1
             fi
 
-            if [[ -f pnpm-lock.yaml ]]; then
-                corepack pnpm install --frozen-lockfile
-                corepack pnpm test
+            if ! command -v corepack >/dev/null 2>&1; then
+                echo "::error::Corepack is not available."
+                exit 1
+            fi
 
-            elif [[ -f yarn.lock ]]; then
-                corepack yarn install --immutable
-                corepack yarn test
+            # ----------------------------------------------
+            # Detect package manager
+            # ----------------------------------------------
+
+            if [[ -f yarn.lock ]]; then
+
+                PACKAGE_MANAGER="yarn"
+
+            elif [[ -f pnpm-lock.yaml ]]; then
+
+                PACKAGE_MANAGER="pnpm"
 
             elif [[ -f package-lock.json ]]; then
-                npm ci
-                npm test
+
+                PACKAGE_MANAGER="npm"
 
             else
-                echo "::error::No supported dependency lockfile found in $project_dir"
+
+                echo "::error::No supported lockfile found in $project_dir"
                 exit 1
+
             fi
+
+            echo "Package manager: $PACKAGE_MANAGER"
+
+            # ----------------------------------------------
+            # Install dependencies
+            # ----------------------------------------------
+
+            case "$PACKAGE_MANAGER" in
+
+                yarn)
+
+                    corepack yarn install --immutable
+                    ;;
+
+                pnpm)
+
+                    corepack pnpm install --frozen-lockfile
+                    ;;
+
+                npm)
+
+                    npm ci
+                    ;;
+
+            esac
+
+            # ----------------------------------------------
+            # Discover test script
+            # ----------------------------------------------
+
+            TEST_SCRIPT="$(
+                node -e '
+                    const pkg = require("./package.json");
+                    const scripts = pkg.scripts || {};
+
+                    if (scripts.test) {
+                        console.log("test");
+                    } else if (scripts.execute) {
+                        console.log("execute");
+                    }
+                '
+            )"
+
+            if [[ -z "$TEST_SCRIPT" ]]; then
+
+                echo "::error::No supported test script (test or execute) found in $project_dir"
+                exit 1
+
+            fi
+
+            echo "Running Node.js script: $TEST_SCRIPT"
+
+            # ----------------------------------------------
+            # Execute tests
+            # ----------------------------------------------
+
+            case "$PACKAGE_MANAGER" in
+
+                yarn)
+
+                    corepack yarn run "$TEST_SCRIPT"
+                    ;;
+
+                pnpm)
+
+                    corepack pnpm run "$TEST_SCRIPT"
+                    ;;
+
+                npm)
+
+                    npm run "$TEST_SCRIPT"
+                    ;;
+
+            esac
+
+            echo "SUCCESS: $project_dir"
             ;;
 
     esac
 
-    echo "SUCCESS: $project_dir"
 done
 
-cd "$(git rev-parse --show-toplevel)"
+# --------------------------------------------------
+# Completion
+# --------------------------------------------------
 
 echo
-echo "All discovered projects passed their test commands."
+echo "======================================"
+echo "All discovered project tests completed."
+echo "======================================"
