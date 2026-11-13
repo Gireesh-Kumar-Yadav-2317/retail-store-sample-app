@@ -46,7 +46,7 @@ jobs:
             docker/checkout/Dockerfile
             docker/load-generator/Dockerfile
             docker/.dockerignore
-            docker/docker-compose.yml
+            docker/docker-compose.yaml
           )
 
           for file in "${required_files[@]}"; do
@@ -194,7 +194,7 @@ jobs:
       # Install Node.js only when a Node.js project is discovered.
       - name: Set up Node.js
         if: needs.discover-runtimes.outputs.node-version != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ needs.discover-runtimes.outputs.node-version }}
 
@@ -244,9 +244,9 @@ jobs:
 
       - name: Set up Node.js
         if: needs.discover-runtimes.outputs.node-version != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: ${{ needs.discover-runtimes.outputs.node-version }}    
+          node-version: ${{ needs.discover-runtimes.outputs.node-version }}   
 
       - name: Run code quality checks
         shell: bash
