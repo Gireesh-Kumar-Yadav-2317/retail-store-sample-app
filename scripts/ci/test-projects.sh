@@ -4,9 +4,12 @@
 set -Eeuo pipefail
 
 readonly SOURCE_DIR="src"
+readonly ROOT_DIR="$(git rev-parse --show-toplevel)"
+
+cd "$ROOT_DIR"
 
 # --------------------------------------------------
-# Validate source directory
+# Validate repository
 # --------------------------------------------------
 
 if [[ ! -d "$SOURCE_DIR" ]]; then
@@ -15,12 +18,11 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
 fi
 
 echo "======================================"
-echo "Discovering application projects..."
+echo "Discovering application test projects"
 echo "======================================"
 
-# --------------------------------------------------
-# Discover supported project manifests
-# --------------------------------------------------
+# E2E tests are deliberately excluded.
+# They run in a separate job where the application is started.
 
 mapfile -t manifests < <(
     find "$SOURCE_DIR" \
@@ -31,6 +33,7 @@ mapfile -t manifests < <(
             -o -name vendor \
             -o -name dist \
             -o -name build \
+            -o -path "$SOURCE_DIR/e2e" \
         \) -prune -o \
         -type f \
         \( \
@@ -42,43 +45,41 @@ mapfile -t manifests < <(
 )
 
 if [[ ${#manifests[@]} -eq 0 ]]; then
-    echo "::error::No supported project manifests were discovered."
+    echo "::error::No supported application projects discovered."
     exit 1
 fi
 
-echo "Discovered ${#manifests[@]} project manifest(s)."
+echo "Discovered ${#manifests[@]} application project(s)."
 
 # --------------------------------------------------
-# Process every discovered project
+# Test each discovered project
 # --------------------------------------------------
+
+tested_projects=0
+skipped_projects=0
 
 for manifest in "${manifests[@]}"; do
 
     project_dir="$(dirname "$manifest")"
 
+    cd "$ROOT_DIR/$project_dir"
+
     echo
     echo "======================================"
     echo "Project: $project_dir"
-    echo "Manifest: $manifest"
     echo "======================================"
-
-    ROOT_DIR="$(git rev-parse --show-toplevel)"
-
-    cd "$ROOT_DIR/$project_dir"
-
-    # --------------------------------------------------
-    # Java / Maven
-    # --------------------------------------------------
 
     case "$manifest" in
 
+        # ------------------------------------------
+        # Java / Maven
+        # ------------------------------------------
+
         */pom.xml)
 
-            echo "Technology detected: Java / Maven"
+            echo "Technology: Java / Maven"
 
             if [[ -f ./mvnw ]]; then
-
-                echo "Using Maven Wrapper"
 
                 bash ./mvnw \
                     --batch-mode \
@@ -87,8 +88,6 @@ for manifest in "${manifests[@]}"; do
 
             elif command -v mvn >/dev/null 2>&1; then
 
-                echo "Using system Maven"
-
                 mvn \
                     --batch-mode \
                     --no-transfer-progress \
@@ -96,151 +95,117 @@ for manifest in "${manifests[@]}"; do
 
             else
 
-                echo "::error::Maven is not installed and Maven Wrapper is missing."
+                echo "::error::Maven and Maven Wrapper are unavailable."
                 exit 1
 
             fi
 
-            echo "SUCCESS: $project_dir"
+            ((tested_projects += 1))
             ;;
 
-        # --------------------------------------------------
+        # ------------------------------------------
         # Go
-        # --------------------------------------------------
+        # ------------------------------------------
 
         */go.mod)
 
-            echo "Technology detected: Go"
+            echo "Technology: Go"
 
             if ! command -v go >/dev/null 2>&1; then
                 echo "::error::Go is not installed."
                 exit 1
             fi
 
-            go test \
-                -race \
-                -count=1 \
-                ./...
+            go test -race -count=1 ./...
 
-            echo "SUCCESS: $project_dir"
+            ((tested_projects += 1))
             ;;
 
-        # --------------------------------------------------
+        # ------------------------------------------
         # Node.js
-        # --------------------------------------------------
+        # ------------------------------------------
 
         */package.json)
 
-            echo "Technology detected: Node.js"
+            echo "Technology: Node.js"
 
             if ! command -v node >/dev/null 2>&1; then
                 echo "::error::Node.js is not installed."
                 exit 1
             fi
 
-            if ! command -v corepack >/dev/null 2>&1; then
-                echo "::error::Corepack is not available."
-                exit 1
+            # Only run actual test scripts.
+            # Do not run "execute" because that may launch Cypress.
+
+            if ! node -e '
+                const pkg = require("./package.json");
+                process.exit(pkg.scripts?.test ? 0 : 1);
+            '; then
+
+                echo "No test script configured. Skipping: $project_dir"
+                ((skipped_projects += 1))
+                continue
+
             fi
 
-            # ----------------------------------------------
-            # Detect package manager
-            # ----------------------------------------------
+            # --------------------------------------
+            # Detect package manager from lockfile
+            # --------------------------------------
 
             if [[ -f yarn.lock ]]; then
-
                 PACKAGE_MANAGER="yarn"
-
             elif [[ -f pnpm-lock.yaml ]]; then
-
                 PACKAGE_MANAGER="pnpm"
-
             elif [[ -f package-lock.json ]]; then
-
                 PACKAGE_MANAGER="npm"
-
             else
-
                 echo "::error::No supported lockfile found in $project_dir"
                 exit 1
-
             fi
 
             echo "Package manager: $PACKAGE_MANAGER"
 
-            # ----------------------------------------------
-            # Install dependencies
-            # ----------------------------------------------
+            # --------------------------------------
+            # Install locked dependencies
+            # --------------------------------------
 
             case "$PACKAGE_MANAGER" in
 
                 yarn)
-
                     corepack yarn install --immutable
                     ;;
 
                 pnpm)
-
                     corepack pnpm install --frozen-lockfile
                     ;;
 
                 npm)
-
                     npm ci
                     ;;
 
             esac
 
-            # ----------------------------------------------
-            # Discover test script
-            # ----------------------------------------------
-
-            TEST_SCRIPT="$(
-                node -e '
-                    const pkg = require("./package.json");
-                    const scripts = pkg.scripts || {};
-
-                    if (scripts.test) {
-                        console.log("test");
-                    } else if (scripts.execute) {
-                        console.log("execute");
-                    }
-                '
-            )"
-
-            if [[ -z "$TEST_SCRIPT" ]]; then
-
-                echo "::error::No supported test script (test or execute) found in $project_dir"
-                exit 1
-
-            fi
-
-            echo "Running Node.js script: $TEST_SCRIPT"
-
-            # ----------------------------------------------
-            # Execute tests
-            # ----------------------------------------------
+            # --------------------------------------
+            # Run application tests
+            # --------------------------------------
 
             case "$PACKAGE_MANAGER" in
 
                 yarn)
-
-                    corepack yarn run "$TEST_SCRIPT"
+                    corepack yarn run test
                     ;;
 
                 pnpm)
-
-                    corepack pnpm run "$TEST_SCRIPT"
+                    corepack pnpm run test
                     ;;
 
                 npm)
-
-                    npm run "$TEST_SCRIPT"
+                    npm run test
                     ;;
 
             esac
 
-            echo "SUCCESS: $project_dir"
+            ((tested_projects += 1))
             ;;
 
     esac
@@ -248,10 +213,18 @@ for manifest in "${manifests[@]}"; do
 done
 
 # --------------------------------------------------
-# Completion
+# Test summary
 # --------------------------------------------------
 
 echo
 echo "======================================"
-echo "All discovered project tests completed."
+echo "Application test execution completed"
 echo "======================================"
+
+echo "Projects tested : $tested_projects"
+echo "Projects skipped: $skipped_projects"
+
+if [[ "$tested_projects" -eq 0 ]]; then
+    echo "::error::No application test projects were executed."
+    exit 1
+fi
